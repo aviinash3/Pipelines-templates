@@ -1,0 +1,118 @@
+trigger:
+- main
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  imageNameDev: 'backend-dev'
+  REGISTRY_NAME: 'registry'
+  tag_latest: 'latest'
+  resourceGroupName: 'BE-RG'
+  webAppName: 'myapp'
+  dockerTag: $[replace(variables['Build.SourceVersionMessage'], ' ', '-')]  
+
+stages:
+  - stage: Build
+    jobs:
+    - job: BuildJob
+      displayName: 'Build and Test'
+      steps:
+      - task: NodeTool@0
+        inputs:
+          versionSpec: '20.x'
+        displayName: 'Install Node.js'
+
+      - script: |
+          npm cache clean --force
+          npm ci
+          npm run build
+        displayName: 'Install dependencies and build'
+
+  - stage: DockerBuildPush
+    dependsOn: Build
+    jobs:
+    - job: DockerPreparation
+      displayName: 'Docker Environment Setup'
+      steps:
+      - script: |
+          echo "Preparing Docker environment"
+          docker --version
+          echo "Checking available disk space"
+          df -h
+        displayName: 'Docker Environment Check'
+        
+    - job: DockerJob
+      displayName: 'Build and Push Docker Images'
+      steps:
+      - task: AzureCLI@2
+        displayName: 'Login to Azure Container Registry'
+        inputs:
+          azureSubscription: 'Azure Service Connection'
+          scriptType: 'bash'
+          scriptLocation: 'inlineScript'
+          inlineScript: |
+            az acr login --name $(REGISTRY_NAME)
+
+      - script: |
+          sanitizedTag=$(echo "$(dockerTag)" | tr ' ' '-' | tr '/' '-' | tr '#' '-' | tr -c '[:alnum:]_.-' '-')
+          sanitizedTag=$(echo "$sanitizedTag" | sed -E 's/^[.-]+//')
+          sanitizedTag=${sanitizedTag:0:128}
+
+          echo "Sanitized Docker tag: $sanitizedTag"
+          tag="$(Build.BuildId)-${sanitizedTag}"
+
+          echo "Building Dev Docker image..."
+          docker build -t $(imageNameDev):${tag} .
+          docker tag $(imageNameDev):${tag} $(REGISTRY_NAME).azurecr.io/$(imageNameDev):${tag}
+          docker tag $(imageNameDev):${tag} $(REGISTRY_NAME).azurecr.io/$(imageNameDev):$(tag_latest)
+
+          echo "Pushing Dev image to Azure Container Registry..."
+          docker push $(REGISTRY_NAME).azurecr.io/$(imageNameDev):${tag}
+          docker push $(REGISTRY_NAME).azurecr.io/$(imageNameDev):$(tag_latest)
+        displayName: 'Docker Build & Push'
+
+  - stage: Deploy
+    jobs:
+    - job: DeployPrep
+      displayName: 'Deployment Preparation'
+      steps:
+      - script: |
+          echo "Preparing deployment environment"
+          echo "Checking Azure CLI version"
+          az --version
+        displayName: 'Deployment Environment Check'
+        
+    - job: DeployDev
+      displayName: 'Deploy Dev Backend to Azure Web App'
+      dependsOn: DockerJob
+      steps:
+      - task: AzureCLI@2
+        displayName: 'Deploy Dev to Azure Web App'
+        inputs:
+          azureSubscription: 'Azure Service Connection'
+          scriptType: 'bash'
+          scriptLocation: 'inlineScript'
+          inlineScript: |
+            az webapp config container set --resource-group $(resourceGroupName) \
+              --name $(webAppName)-dev \
+              --docker-custom-image-name $(REGISTRY_NAME).azurecr.io/$(imageNameDev):$(tag_latest)
+            
+            az webapp restart --resource-group $(resourceGroupName) --name $(webAppName)-dev
+
+    - job: DeployProd
+      displayName: 'Deploy Prod Backend to Azure Web App'
+      dependsOn: DockerJob
+      steps:
+      - task: AzureCLI@2
+        displayName: 'Deploy Prod to Azure Web App'
+        inputs:
+          azureSubscription: 'Azure Service Connection'
+          scriptType: 'bash'
+          scriptLocation: 'inlineScript'
+          inlineScript: |
+            az webapp config container set --resource-group $(resourceGroupName) \
+              --name $(webAppName)-prod \
+              --docker-custom-image-name $(REGISTRY_NAME).azurecr.io/$(imageNameProd):$(tag_latest)
+            
+            az webapp restart --resource-group $(resourceGroupName) --name $(webAppName)-prod
